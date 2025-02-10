@@ -1,11 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-
-import os
-
 from sklearn.metrics import confusion_matrix
-
+import os
 
 __all__ = [
     # "plot_loss",
