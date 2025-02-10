@@ -21,6 +21,8 @@ from sklearn.metrics import accuracy_score
 __all__ = [
     "initialize_weights",
     "compute_accuracy",
+    "compute_majority_accuracy",
+    "compute_majority_accuracy",
     # "plot_loss",
     # "plot_accuracy",
     "EarlyStopping",
@@ -30,7 +32,10 @@ __all__ = [
 
 # TRAINING
 
-def compute_accuracy(model, loader, device):
+def compute_accuracy(models, loader, device):
+    if not isinstance(models, list):
+        models = [models]
+
     correct: int = 0
     total: int = 0
 
@@ -38,20 +43,90 @@ def compute_accuracy(model, loader, device):
 
     with torch.no_grad():
         for data in loader:
+            predictions = []
             images, labels = data
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
+            for model in models:
+                outputs =  model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                predictions.append(predicted)
             y_hat += list(predicted.numpy(force=True))
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
     return correct/total*100, y_hat
 
+def compute_majority2_accuracy(models, loader, device):
+    if not isinstance(models, list):
+        models = [models]
+
+    total = 0
+    global_correct = 0
+    majority_predictions = []
+
+    with torch.no_grad():
+        for data in loader:
+            images, labels = data
+            images, labels = images.to(device), labels.to(device)
+
+            predictions = []  # predictions of all models
+            for model in models:
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                predictions.append(predicted.unsqueeze(0))
+
+            # majority vote
+            stacked_preds = torch.cat(predictions, dim=0)
+            majority_vote, _ = torch.mode(stacked_preds, dim=0)  # Most common prediction
+
+            majority_predictions += list(majority_vote.cpu().numpy())
+            global_correct += (majority_vote == labels).sum().item()
+            total += labels.size(0)
+
+    # Compute global accuracy
+    majority_accuracy = (global_correct / total) * 100
+
+    return majority_accuracy, majority_predictions
+
+def compute_majority_accuracy(models, loader, device):
+    if not isinstance(models, list):
+        models = [models]
+
+    total = 0
+    global_correct = 0
+    avg_predictions = []
+
+    with torch.no_grad():
+        for data in loader:
+            images, labels = data
+            images, labels = images.to(device), labels.to(device)
+
+            avg_logits = None  # Store summed logits
+            for model in models:
+                outputs = model(images)  # Get raw logits (before softmax)
+                if avg_logits is None:
+                    avg_logits = outputs
+                else:
+                    avg_logits += outputs  # Sum logits across models
+
+            avg_logits /= len(models)  # Compute arithmetic mean
+
+            _, final_predicted = torch.max(avg_logits, 1)  # Get final predictions
+            avg_predictions += list(final_predicted.cpu().numpy())  # Convert to list
+            global_correct += (final_predicted == labels).sum().item()
+            total += labels.size(0)
+
+    # Compute global accuracy
+    avg_accuracy = (global_correct / total) * 100
+
+    return avg_accuracy, avg_predictions
+
+
+
 class EarlyStopping:
-    def __init__(self, patience: int = 10):
-        self.patience: int = patience
-        self.counter: int = 0
-        self.current: float = float('inf')
+    def __init__(self, patience=10):
+        self.patience = patience
+        self.counter = 0
+        self.current = float('inf')
 
     def __call__(self, value):
         if self.counter > self.patience:
@@ -65,17 +140,18 @@ class EarlyStopping:
             # worse value
             self.counter += 1
         return False
-    
-    
+
 def training(model, 
              loaders,
              optimizer, 
              loss_function=nn.CrossEntropyLoss(),
-             num_epochs=50, 
-             early_stopper=EarlyStopping(),
-             device=torch.device('cuda')
+             num_epochs=100, 
+             early_stopper=EarlyStopping(10),
+             device=torch.device('cuda'),
+             best_model=False
              ):
-    
+    """Function used to train a single model"""
+
     train_loader, val_loader, test_loader = loaders
 
     train_losses = []
@@ -83,6 +159,10 @@ def training(model,
     train_accuracies = []
     val_accuracies = []
     test_accuracies = []
+    
+    if best_model:
+        best_val_loss = float('inf')
+        best_model_state = None
 
     model.to(device)
 
@@ -136,17 +216,28 @@ def training(model,
         train_accuracies.append(train_accuracy)
         val_accuracies.append(val_accuracy)
         test_accuracies.append(test_accuracy)
+
+        # save best model
+        if best_model:
+            if val_loss <= best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict()
     
         if early_stopper is not None:
             if early_stopper(val_loss):
                 break
+        
+    # load best state
+    if best_model:
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
         
     return (train_losses, val_losses), (train_accuracies, val_accuracies, test_accuracies)
 
 # MODEL
 
 class CNN(nn.Module):
-    def __init__(self, kernel_size=3, batch_norm=False, dropout=0, linear=False):
+    def __init__(self, kernel_size=3, batch_norm=False, dropout=0, conv=False, linear=False):
         super(CNN, self).__init__()
 
         self.device = torch.device('cpu')
@@ -189,6 +280,12 @@ class CNN(nn.Module):
         if self.dropout > 0:
             layers.append(nn.Dropout(self.dropout))
         layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+
+        # fourth optional block
+        layers.append(nn.Conv2d(in_channels=32, out_channels=32, kernel_size=self.kernel_size, stride=1, padding=self.padding))
+        if self.batch_norm:
+            layers.append(nn.BatchNorm2d(num_features=32))
+        layers.append(nn.ReLU())
 
         layers.append(nn.Flatten(1))
         if self.linear:
